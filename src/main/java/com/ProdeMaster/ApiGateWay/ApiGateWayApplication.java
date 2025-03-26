@@ -9,7 +9,9 @@ import org.springframework.cloud.client.discovery.EnableDiscoveryClient;
 public class ApiGateWayApplication {
 
 	public static void main(String[] args) {
+
 		SpringApplication.run(ApiGateWayApplication.class, args);
+
 	}
 
 }
