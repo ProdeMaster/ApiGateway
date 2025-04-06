@@ -1,7 +1,6 @@
 package com.ProdeMaster.ApiGateWay;
 
 import brave.Tracer;
-import com.netflix.discovery.converters.Auto;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.cloud.gateway.filter.GatewayFilterChain;
 import org.springframework.cloud.gateway.filter.GlobalFilter;
