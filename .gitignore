@@ -31,3 +31,9 @@ build/
 
 ### VS Code ###
 .vscode/
+
+### Claude ###
+.claude/
+
+### Certificados ###
+src/main/resources/certs
