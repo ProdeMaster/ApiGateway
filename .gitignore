@@ -35,5 +35,5 @@ build/
 ### Claude ###
 .claude/
 
-### Certificados ###
-src/main/resources/certs
+### Certificados y claves
+/src/main/resources/certs
