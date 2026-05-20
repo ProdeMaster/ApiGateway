@@ -8,38 +8,55 @@ import org.springframework.security.web.server.SecurityWebFilterChain;
 import org.springframework.security.web.server.context.NoOpServerSecurityContextRepository;
 
 /**
- * Configures Spring WebFlux Security in stateless mode.
+ * Spring WebFlux Security configuration (stateless, JWT-based).
  *
- * Auth enforcement (JWT validation, 401 responses, header injection) is handled
- * by JwtAuthenticationFilter, which runs as a GlobalFilter at order -100 —
- * before
- * any Gateway routing. Spring Security here disables CSRF/sessions/form-login
- * and
- * defers to that filter rather than duplicating auth logic.
+ * Design: Spring Security is permissive at this layer (anyExchange().permitAll()).
+ * Actual auth enforcement is done by JwtAuthenticationFilter (GlobalFilter, order -100)
+ * which intercepts BEFORE routing and returns 401/403 with structured JSON responses.
+ *
+ * Public routes (no JWT required): configured via jwt.public-paths in application.properties
+ * Protected Actuator endpoints (/prometheus, /metrics, /env, /loggers): NOT in jwt.public-paths,
+ *   so JwtAuthenticationFilter will enforce JWT for those routes.
+ *
+ * Item 2.5: public vs protected paths. Item 2.8: actuator protection.
  */
 @Configuration
 @EnableWebFluxSecurity
 public class SecurityConfig {
 
-        @Bean
-        public SecurityWebFilterChain springSecurityFilterChain(ServerHttpSecurity http) {
-                return http
-                                .csrf(ServerHttpSecurity.CsrfSpec::disable)
-                                .httpBasic(ServerHttpSecurity.HttpBasicSpec::disable)
-                                .formLogin(ServerHttpSecurity.FormLoginSpec::disable)
-                                .logout(ServerHttpSecurity.LogoutSpec::disable)
-                                // Stateless API: no server-side session or security context storage
-                                .securityContextRepository(NoOpServerSecurityContextRepository.getInstance())
-                                .authorizeExchange(exchanges -> exchanges
-                                                .pathMatchers(
-                                                                "/api/public/**",
-                                                                "/actuator/health",
-                                                                "/actuator/info",
-                                                                "/test")
-                                                .permitAll()
-                                                // JwtAuthenticationFilter (GlobalFilter, order -100) enforces JWT
-                                                // and returns 401 for invalid/missing tokens on all other routes
-                                                .anyExchange().permitAll())
-                                .build();
-        }
+    @Bean
+    public SecurityWebFilterChain springSecurityFilterChain(ServerHttpSecurity http) {
+        return http
+                .csrf(ServerHttpSecurity.CsrfSpec::disable)
+                .httpBasic(ServerHttpSecurity.HttpBasicSpec::disable)
+                .formLogin(ServerHttpSecurity.FormLoginSpec::disable)
+                .logout(ServerHttpSecurity.LogoutSpec::disable)
+                // Stateless API: no server-side session, no security context stored
+                .securityContextRepository(NoOpServerSecurityContextRepository.getInstance())
+                .authorizeExchange(exchanges -> exchanges
+                        // Public: health check (no JWT required)
+                        .pathMatchers(
+                                "/actuator/health",
+                                "/actuator/health/**"
+                        ).permitAll()
+                        // Public: authentication flows (login, register, refresh)
+                        .pathMatchers(
+                                "/users/auth/login",
+                                "/users/auth/register",
+                                "/users/auth/refresh"
+                        ).permitAll()
+                        // Protected Actuator: sensitive endpoints require JWT
+                        // JwtAuthenticationFilter enforces the 401 since these are NOT in jwt.public-paths
+                        // Note: if ops team uses Prometheus scraping, consider mTLS or API key instead of JWT
+                        .pathMatchers(
+                                "/actuator/prometheus",
+                                "/actuator/metrics",
+                                "/actuator/env",
+                                "/actuator/loggers"
+                        ).permitAll()   // Spring Security allows; JWT GlobalFilter enforces
+                        // All other paths: Spring Security defers to JwtAuthenticationFilter
+                        .anyExchange().permitAll()
+                )
+                .build();
+    }
 }
