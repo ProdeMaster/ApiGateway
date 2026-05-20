@@ -1,0 +1,12 @@
+package com.ProdeMaster.ApiGateWay.dto;
+
+public enum ErrorCode {
+    INVALID_TOKEN,
+    EXPIRED_TOKEN,
+    MISSING_TOKEN,
+    INSUFFICIENT_PERMISSIONS,
+    INVALID_SIGNATURE,
+    ALGORITHM_MISMATCH,
+    CLAIM_VALIDATION_FAILED,
+    INTERNAL_ERROR
+}
