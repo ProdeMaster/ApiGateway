@@ -1,11 +1,15 @@
 package com.ProdeMaster.ApiGateWay.filters;
 
+import com.ProdeMaster.ApiGateWay.Config.JwtProperties;
+import com.ProdeMaster.ApiGateWay.dto.ErrorCode;
+import com.ProdeMaster.ApiGateWay.dto.ErrorResponse;
 import com.ProdeMaster.ApiGateWay.security.JwtTokenProvider;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.jsonwebtoken.*;
+import io.jsonwebtoken.security.SignatureException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.cloud.gateway.filter.GatewayFilterChain;
 import org.springframework.cloud.gateway.filter.GlobalFilter;
 import org.springframework.core.Ordered;
@@ -20,11 +24,19 @@ import org.springframework.util.AntPathMatcher;
 import org.springframework.web.server.ServerWebExchange;
 import reactor.core.publisher.Mono;
 
+import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
-import java.util.Arrays;
+import java.time.Instant;
 import java.util.List;
-import java.util.Map;
+import java.util.Optional;
+import java.util.UUID;
 
+/**
+ * GlobalFilter (order -100) that enforces JWT authentication on all non-public routes.
+ * Validates tokens via JwtTokenProvider and injects user context headers for downstream services.
+ *
+ * Items 2.4 (headers), 2.7 (logging), 2.9 (error responses) implemented here.
+ */
 @Component
 public class JwtAuthenticationFilter implements GlobalFilter, Ordered {
 
@@ -33,19 +45,14 @@ public class JwtAuthenticationFilter implements GlobalFilter, Ordered {
 
     private final JwtTokenProvider jwtTokenProvider;
     private final ObjectMapper objectMapper;
+    private final JwtProperties jwtProperties;
 
-    @Value("${jwt.issuer}")
-    private String issuer;
-
-    @Value("${jwt.audience}")
-    private String audience;
-
-    @Value("${jwt.public-paths:/actuator/health,/actuator/info}")
-    private String[] publicPaths;
-
-    public JwtAuthenticationFilter(JwtTokenProvider jwtTokenProvider, ObjectMapper objectMapper) {
+    public JwtAuthenticationFilter(JwtTokenProvider jwtTokenProvider,
+                                    ObjectMapper objectMapper,
+                                    JwtProperties jwtProperties) {
         this.jwtTokenProvider = jwtTokenProvider;
         this.objectMapper = objectMapper;
+        this.jwtProperties = jwtProperties;
     }
 
     @Override
@@ -64,51 +71,145 @@ public class JwtAuthenticationFilter implements GlobalFilter, Ordered {
 
         String authHeader = request.getHeaders().getFirst(HttpHeaders.AUTHORIZATION);
         if (authHeader == null || !authHeader.startsWith("Bearer ")) {
-            return rejectUnauthorized(exchange, "Missing or malformed Authorization header");
+            logMissingToken(path, resolveClientIp(request));
+            return rejectWithError(exchange, ErrorCode.MISSING_TOKEN, HttpStatus.UNAUTHORIZED,
+                    "Token not present in Authorization header");
         }
 
         String token = authHeader.substring(7);
+        long startMs = System.currentTimeMillis();
 
-        return jwtTokenProvider.validateToken(token, issuer, audience)
-                .flatMap(isValid -> {
-                    if (Boolean.FALSE.equals(isValid)) {
-                        return rejectUnauthorized(exchange, "Token inválido o expirado");
-                    }
-                    return jwtTokenProvider.extractUserId(token)
-                            .zipWith(jwtTokenProvider.extractRoles(token))
-                            .flatMap(tuple -> {
-                                String userId = tuple.getT1();
-                                List<String> roles = tuple.getT2();
-
-                                ServerHttpRequest mutatedRequest = request.mutate()
-                                        .header("X-User-Id", userId)
-                                        .header("X-Roles", String.join(",", roles))
-                                        .headers(h -> h.remove(HttpHeaders.AUTHORIZATION))
-                                        .build();
-
-                                return chain.filter(exchange.mutate().request(mutatedRequest).build());
-                            });
+        return jwtTokenProvider.validateAndExtract(token)
+                .flatMap(claims -> {
+                    logValidationSuccess(claims, System.currentTimeMillis() - startMs);
+                    return injectHeadersAndContinue(exchange, chain, request, claims);
+                })
+                .onErrorResume(ExpiredJwtException.class, e -> {
+                    logValidationFailure(path, "EXPIRED_TOKEN", e.getMessage());
+                    return rejectWithError(exchange, ErrorCode.EXPIRED_TOKEN, HttpStatus.UNAUTHORIZED,
+                            "Token expired");
+                })
+                .onErrorResume(SignatureException.class, e -> {
+                    logValidationFailure(path, "INVALID_SIGNATURE", e.getMessage());
+                    return rejectWithError(exchange, ErrorCode.INVALID_SIGNATURE, HttpStatus.UNAUTHORIZED,
+                            "Token signature is invalid");
+                })
+                .onErrorResume(UnsupportedJwtException.class, e -> {
+                    logValidationFailure(path, "ALGORITHM_MISMATCH", e.getMessage());
+                    return rejectWithError(exchange, ErrorCode.ALGORITHM_MISMATCH, HttpStatus.UNAUTHORIZED,
+                            "Algorithm not permitted. Only RSA algorithms accepted.");
+                })
+                .onErrorResume(MalformedJwtException.class, e -> {
+                    logValidationFailure(path, "INVALID_TOKEN", e.getMessage());
+                    return rejectWithError(exchange, ErrorCode.INVALID_TOKEN, HttpStatus.UNAUTHORIZED,
+                            "Token is malformed or corrupted");
+                })
+                .onErrorResume(JwtException.class, e -> {
+                    logValidationFailure(path, "CLAIM_VALIDATION_FAILED", e.getMessage());
+                    return rejectWithError(exchange, ErrorCode.CLAIM_VALIDATION_FAILED, HttpStatus.UNAUTHORIZED,
+                            e.getMessage());
                 });
     }
 
+    /**
+     * Item 2.4: Injects user context headers for downstream microservices and removes Authorization.
+     * Downstream services should trust X-User-Id and X-Roles as the gateway already validated them.
+     */
+    private Mono<Void> injectHeadersAndContinue(ServerWebExchange exchange,
+                                                  GatewayFilterChain chain,
+                                                  ServerHttpRequest request,
+                                                  Claims claims) {
+        String userId = claims.getSubject();
+        List<String> roles = extractRoles(claims);
+        String issuedAtMs = claims.getIssuedAt() != null
+                ? String.valueOf(claims.getIssuedAt().toInstant().toEpochMilli())
+                : "";
+
+        if (jwtProperties.isLoggingVerbose()) {
+            log.debug("JWT_HEADERS injecting userId={} rolesCount={}", userId, roles.size());
+        }
+
+        ServerHttpRequest mutated = request.mutate()
+                .header("X-User-Id", userId)
+                .header("X-Roles", String.join(",", roles))
+                .header("X-Token-Issued-At", issuedAtMs)
+                .header("X-Auth-Source", "jwt")
+                .headers(h -> h.remove(HttpHeaders.AUTHORIZATION))  // never forward raw token downstream
+                .build();
+
+        return chain.filter(exchange.mutate().request(mutated).build());
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<String> extractRoles(Claims claims) {
+        Object roles = claims.get("roles");
+        if (roles instanceof List<?> list) {
+            return (List<String>) list;
+        }
+        return List.of();
+    }
+
     private boolean isPublicPath(String path) {
-        return Arrays.stream(publicPaths)
+        return jwtProperties.getPublicPaths().stream()
                 .anyMatch(pattern -> PATH_MATCHER.match(pattern.trim(), path));
     }
 
-    private Mono<Void> rejectUnauthorized(ServerWebExchange exchange, String reason) {
+    private Mono<Void> rejectWithError(ServerWebExchange exchange, ErrorCode errorCode,
+                                        HttpStatus status, String message) {
         ServerHttpResponse response = exchange.getResponse();
-        response.setStatusCode(HttpStatus.UNAUTHORIZED);
+        response.setStatusCode(status);
         response.getHeaders().setContentType(MediaType.APPLICATION_JSON);
+
+        String traceId = Optional.ofNullable(org.slf4j.MDC.get("traceId"))
+                .filter(s -> !s.isBlank())
+                .orElse(UUID.randomUUID().toString());
+
+        ErrorResponse body = ErrorResponse.builder()
+                .error(errorCode.name())
+                .message(message)
+                .traceId(traceId)
+                .timestamp(Instant.now().toString())
+                .path(exchange.getRequest().getPath().value())
+                .build();
 
         String json;
         try {
-            json = objectMapper.writeValueAsString(Map.of("error", "Token inválido", "reason", reason));
+            json = objectMapper.writeValueAsString(body);
         } catch (JsonProcessingException e) {
-            json = "{\"error\":\"Token inv\\u00e1lido\",\"reason\":\"Error interno\"}";
+            json = "{\"error\":\"INTERNAL_ERROR\",\"message\":\"Error serializing response\"}";
         }
 
         DataBuffer buffer = response.bufferFactory().wrap(json.getBytes(StandardCharsets.UTF_8));
         return response.writeWith(Mono.just(buffer));
+    }
+
+    // Item 2.7: Logging with token masking — never log the full token value
+
+    private void logValidationSuccess(Claims claims, long durationMs) {
+        log.info("JWT_VALIDATION status=SUCCESS userId={} roles={} duration_ms={}",
+                claims.getSubject(), extractRoles(claims).size(), durationMs);
+    }
+
+    private void logValidationFailure(String path, String reason, String detail) {
+        if (jwtProperties.isLoggingVerbose()) {
+            log.warn("JWT_VALIDATION status=FAILED reason={} path={} detail={}", reason, path, detail);
+        } else {
+            log.warn("JWT_VALIDATION status=FAILED reason={} path={}", reason, path);
+        }
+    }
+
+    private void logMissingToken(String path, String clientIp) {
+        log.warn("JWT_VALIDATION status=FAILED reason=MISSING_TOKEN path={} clientIp={}", path, clientIp);
+    }
+
+    private String resolveClientIp(ServerHttpRequest request) {
+        String forwarded = request.getHeaders().getFirst("X-Forwarded-For");
+        if (forwarded != null && !forwarded.isBlank()) {
+            return forwarded.split(",")[0].trim();
+        }
+        return Optional.ofNullable(request.getRemoteAddress())
+                .map(InetSocketAddress::getAddress)
+                .map(java.net.InetAddress::getHostAddress)
+                .orElse("unknown");
     }
 }
