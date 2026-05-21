@@ -4,12 +4,17 @@ import com.ProdeMaster.ApiGateWay.Config.JwtProperties;
 import com.ProdeMaster.ApiGateWay.dto.ErrorCode;
 import com.ProdeMaster.ApiGateWay.dto.ErrorResponse;
 import com.ProdeMaster.ApiGateWay.security.JwtTokenProvider;
+import com.ProdeMaster.ApiGateWay.security.TokenBlacklistService;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.jsonwebtoken.*;
 import io.jsonwebtoken.security.SignatureException;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 import org.springframework.cloud.gateway.filter.GatewayFilterChain;
 import org.springframework.cloud.gateway.filter.GlobalFilter;
 import org.springframework.core.Ordered;
@@ -30,12 +35,14 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 
 /**
  * GlobalFilter (order -100) that enforces JWT authentication on all non-public routes.
  * Validates tokens via JwtTokenProvider and injects user context headers for downstream services.
  *
- * Items 2.4 (headers), 2.7 (logging), 2.9 (error responses) implemented here.
+ * Items 2.4 (headers), 2.7 (logging), 2.9 (error responses) from Phase 2.
+ * Items 3.1 (blacklist check), 3.2 (MDC role for sampler), 3.3 (Prometheus metrics) from Phase 3.
  */
 @Component
 public class JwtAuthenticationFilter implements GlobalFilter, Ordered {
@@ -44,15 +51,21 @@ public class JwtAuthenticationFilter implements GlobalFilter, Ordered {
     private static final AntPathMatcher PATH_MATCHER = new AntPathMatcher();
 
     private final JwtTokenProvider jwtTokenProvider;
+    private final TokenBlacklistService tokenBlacklistService;
     private final ObjectMapper objectMapper;
     private final JwtProperties jwtProperties;
+    private final MeterRegistry meterRegistry;
 
     public JwtAuthenticationFilter(JwtTokenProvider jwtTokenProvider,
+                                    TokenBlacklistService tokenBlacklistService,
                                     ObjectMapper objectMapper,
-                                    JwtProperties jwtProperties) {
+                                    JwtProperties jwtProperties,
+                                    MeterRegistry meterRegistry) {
         this.jwtTokenProvider = jwtTokenProvider;
+        this.tokenBlacklistService = tokenBlacklistService;
         this.objectMapper = objectMapper;
         this.jwtProperties = jwtProperties;
+        this.meterRegistry = meterRegistry;
     }
 
     @Override
@@ -72,6 +85,7 @@ public class JwtAuthenticationFilter implements GlobalFilter, Ordered {
         String authHeader = request.getHeaders().getFirst(HttpHeaders.AUTHORIZATION);
         if (authHeader == null || !authHeader.startsWith("Bearer ")) {
             logMissingToken(path, resolveClientIp(request));
+            recordValidationMetric("missing");
             return rejectWithError(exchange, ErrorCode.MISSING_TOKEN, HttpStatus.UNAUTHORIZED,
                     "Token not present in Authorization header");
         }
@@ -81,46 +95,91 @@ public class JwtAuthenticationFilter implements GlobalFilter, Ordered {
 
         return jwtTokenProvider.validateAndExtract(token)
                 .flatMap(claims -> {
-                    logValidationSuccess(claims, System.currentTimeMillis() - startMs);
-                    return injectHeadersAndContinue(exchange, chain, request, claims);
+                    // Item 3.1: check blacklist using jti (preferred) or token fingerprint
+                    String blacklistKey = claims.getId() != null
+                            ? claims.getId()
+                            : TokenBlacklistService.tokenFingerprint(token);
+
+                    return tokenBlacklistService.isTokenBlacklisted(blacklistKey)
+                            .flatMap(blacklisted -> {
+                                if (blacklisted) {
+                                    recordValidationMetric("blacklisted");
+                                    log.warn("TOKEN_BLACKLIST revoked_token_detected userId={}", claims.getSubject());
+                                    return rejectWithError(exchange, ErrorCode.TOKEN_REVOKED,
+                                            HttpStatus.UNAUTHORIZED, "Token has been revoked");
+                                }
+
+                                long durationMs = System.currentTimeMillis() - startMs;
+                                recordValidationMetric("success");
+                                recordValidationTime(durationMs);
+                                logValidationSuccess(claims, durationMs);
+
+                                // Item 3.2: populate MDC so DynamicTracingSampler can read the role
+                                List<String> roles = extractRoles(claims);
+                                MDC.put("user_role", String.join(",", roles));
+
+                                return injectHeadersAndContinue(exchange, chain, request, claims, roles)
+                                        .doFinally(sig -> MDC.remove("user_role"));
+                            });
                 })
                 .onErrorResume(ExpiredJwtException.class, e -> {
+                    recordValidationMetric("expired");
                     logValidationFailure(path, "EXPIRED_TOKEN", e.getMessage());
                     return rejectWithError(exchange, ErrorCode.EXPIRED_TOKEN, HttpStatus.UNAUTHORIZED,
                             "Token expired");
                 })
                 .onErrorResume(SignatureException.class, e -> {
+                    recordValidationMetric("invalid");
                     logValidationFailure(path, "INVALID_SIGNATURE", e.getMessage());
                     return rejectWithError(exchange, ErrorCode.INVALID_SIGNATURE, HttpStatus.UNAUTHORIZED,
                             "Token signature is invalid");
                 })
                 .onErrorResume(UnsupportedJwtException.class, e -> {
+                    recordValidationMetric("invalid");
                     logValidationFailure(path, "ALGORITHM_MISMATCH", e.getMessage());
                     return rejectWithError(exchange, ErrorCode.ALGORITHM_MISMATCH, HttpStatus.UNAUTHORIZED,
                             "Algorithm not permitted. Only RSA algorithms accepted.");
                 })
                 .onErrorResume(MalformedJwtException.class, e -> {
+                    recordValidationMetric("invalid");
                     logValidationFailure(path, "INVALID_TOKEN", e.getMessage());
                     return rejectWithError(exchange, ErrorCode.INVALID_TOKEN, HttpStatus.UNAUTHORIZED,
                             "Token is malformed or corrupted");
                 })
                 .onErrorResume(JwtException.class, e -> {
+                    recordValidationMetric("invalid");
                     logValidationFailure(path, "CLAIM_VALIDATION_FAILED", e.getMessage());
                     return rejectWithError(exchange, ErrorCode.CLAIM_VALIDATION_FAILED, HttpStatus.UNAUTHORIZED,
                             e.getMessage());
                 });
     }
 
+    // Item 3.3: Micrometer counters — one per validation outcome
+
+    private void recordValidationMetric(String result) {
+        Counter.builder("jwt.validations.total")
+                .tag("result", result)
+                .register(meterRegistry)
+                .increment();
+    }
+
+    private void recordValidationTime(long durationMillis) {
+        Timer.builder("jwt.validations.duration_seconds")
+                .publishPercentiles(0.95, 0.99)
+                .register(meterRegistry)
+                .record(durationMillis, TimeUnit.MILLISECONDS);
+    }
+
     /**
      * Item 2.4: Injects user context headers for downstream microservices and removes Authorization.
-     * Downstream services should trust X-User-Id and X-Roles as the gateway already validated them.
+     * Also stores userId as an exchange attribute so RateLimitingFilter can use it for per-user buckets.
      */
     private Mono<Void> injectHeadersAndContinue(ServerWebExchange exchange,
                                                   GatewayFilterChain chain,
                                                   ServerHttpRequest request,
-                                                  Claims claims) {
+                                                  Claims claims,
+                                                  List<String> roles) {
         String userId = claims.getSubject();
-        List<String> roles = extractRoles(claims);
         String issuedAtMs = claims.getIssuedAt() != null
                 ? String.valueOf(claims.getIssuedAt().toInstant().toEpochMilli())
                 : "";
@@ -128,6 +187,10 @@ public class JwtAuthenticationFilter implements GlobalFilter, Ordered {
         if (jwtProperties.isLoggingVerbose()) {
             log.debug("JWT_HEADERS injecting userId={} rolesCount={}", userId, roles.size());
         }
+
+        // Exchange attributes are visible to subsequent GlobalFilters (e.g., RateLimitingFilter)
+        exchange.getAttributes().put("userId", userId);
+        exchange.getAttributes().put("userRoles", roles);
 
         ServerHttpRequest mutated = request.mutate()
                 .header("X-User-Id", userId)
@@ -160,7 +223,7 @@ public class JwtAuthenticationFilter implements GlobalFilter, Ordered {
         response.setStatusCode(status);
         response.getHeaders().setContentType(MediaType.APPLICATION_JSON);
 
-        String traceId = Optional.ofNullable(org.slf4j.MDC.get("traceId"))
+        String traceId = Optional.ofNullable(MDC.get("traceId"))
                 .filter(s -> !s.isBlank())
                 .orElse(UUID.randomUUID().toString());
 
