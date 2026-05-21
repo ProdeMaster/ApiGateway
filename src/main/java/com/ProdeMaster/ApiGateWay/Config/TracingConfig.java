@@ -8,44 +8,31 @@ import org.springframework.web.server.WebFilter;
 import reactor.core.publisher.Hooks;
 import reactor.util.context.ContextView;
 
-import brave.handler.SpanHandler;
-import brave.sampler.Sampler;
-import zipkin2.reporter.AsyncReporter;
-import zipkin2.reporter.Reporter;
-import zipkin2.reporter.urlconnection.URLConnectionSender;
-import zipkin2.reporter.brave.ZipkinSpanHandler;
-import zipkin2.Span;
-
 import jakarta.annotation.PostConstruct;
 
+/**
+ * Tracing configuration.
+ *
+ * Item 3.7: Zipkin reporter and span handler are now auto-configured by Spring Boot from
+ *   management.zipkin.tracing.endpoint (see application.properties / application-prod.properties).
+ *   The hardcoded URLConnectionSender bean has been removed.
+ *
+ * Item 3.2: Sampling is handled by DynamicTracingSampler (@Component), which overrides the
+ *   default auto-configured sampler and adjusts rates based on the authenticated role in MDC.
+ */
 @Configuration
 public class TracingConfig {
 
     @PostConstruct
     public void init() {
-        // Habilita automáticamente la restauración del contexto Reactor → MDC
+        // Enables automatic MDC ↔ Reactor context propagation across thread hops.
         Hooks.enableAutomaticContextPropagation();
     }
 
-    // Envía spans a Zipkin (localhost:9411 por defecto)
-    @Bean
-    public Reporter<zipkin2.Span> zipkinReporter() {
-        return AsyncReporter.create(URLConnectionSender.create("http://localhost:9411/api/v2/spans"));
-    }
-
-    // Handler de Zipkin para enviar los spans
-    @Bean
-    public SpanHandler zipkinSpanHandler(Reporter<zipkin2.Span> reporter) {
-        return ZipkinSpanHandler.create(reporter);
-    }
-
-    // Samplear 100% de las peticiones (ideal en desarrollo)
-    @Bean
-    public Sampler defaultSampler() {
-        return Sampler.ALWAYS_SAMPLE;
-    }
-
-    // Filtro para propagar el contexto de trazabilidad a MDC en cada request
+    /**
+     * Propagates Micrometer trace/span IDs into MDC so they appear in structured log output
+     * and are accessible to DynamicTracingSampler.
+     */
     @Bean
     public WebFilter mdcWebFilter(Tracer tracer) {
         return (exchange, chain) -> chain.filter(exchange)
@@ -58,10 +45,9 @@ public class TracingConfig {
     private void putToMdc(ContextView contextView, Tracer tracer) {
         try {
             String traceId = tracer.currentSpan() != null ? tracer.currentSpan().context().traceId() : "";
-            String spanId = tracer.currentSpan() != null ? tracer.currentSpan().context().spanId() : "";
-
+            String spanId  = tracer.currentSpan() != null ? tracer.currentSpan().context().spanId()  : "";
             MDC.put("traceId", traceId);
-            MDC.put("spanId", spanId);
+            MDC.put("spanId",  spanId);
         } catch (Exception ignored) {
         }
     }
