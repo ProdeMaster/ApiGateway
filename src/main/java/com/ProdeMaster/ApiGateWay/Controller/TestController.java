@@ -10,11 +10,9 @@ import org.springframework.web.bind.annotation.RestController;
 import reactor.core.publisher.Mono;
 
 /**
- * Development-only endpoint. Disabled by default via app.endpoints.test.enabled=false.
- * To enable in dev: set app.endpoints.test.enabled=true in application-dev.properties.
- * GET /test without this property set to true → 404 Not Found (bean not registered).
- *
- * Item 2.10: Option C (conditional property).
+ * Development-only endpoint. Disabled by default via {@code app.endpoints.test.enabled=false}.
+ * To enable in dev: set {@code app.endpoints.test.enabled=true} in {@code application-dev.properties}.
+ * GET {@code /test} without this property returns 404 Not Found (bean not registered).
  */
 @RestController
 @RequestMapping("/test")

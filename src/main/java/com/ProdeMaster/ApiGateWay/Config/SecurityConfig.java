@@ -8,22 +8,68 @@ import org.springframework.security.web.server.SecurityWebFilterChain;
 import org.springframework.security.web.server.context.NoOpServerSecurityContextRepository;
 
 /**
- * Spring WebFlux Security configuration (stateless, JWT-based).
+ * Spring WebFlux Security configuration for the API Gateway.
  *
- * Design: Spring Security is permissive at this layer (anyExchange().permitAll()).
- * Actual auth enforcement is done by JwtAuthenticationFilter (GlobalFilter, order -100)
- * which intercepts BEFORE routing and returns 401/403 with structured JSON responses.
+ * <p>Design intent — two-layer authorisation model:</p>
+ * <ol>
+ *   <li>This class configures Spring Security to be <em>permissive</em> at the framework level
+ *       ({@code anyExchange().permitAll()}).  CSRF, HTTP Basic, form login, and server-side
+ *       sessions are all disabled because the gateway is stateless and JWT-based.</li>
+ *   <li>{@link com.ProdeMaster.ApiGateWay.filters.JwtAuthenticationFilter} (order {@code -100})
+ *       performs the actual JWT enforcement <em>before</em> any route is resolved, returning
+ *       structured {@code 401} JSON responses for unauthenticated requests.</li>
+ * </ol>
+ * This separation keeps Spring Security lightweight while preserving full control over
+ * authentication responses in the gateway filter chain.
  *
- * Public routes (no JWT required): configured via jwt.public-paths in application.properties
- * Protected Actuator endpoints (/prometheus, /metrics, /env, /loggers): NOT in jwt.public-paths,
- *   so JwtAuthenticationFilter will enforce JWT for those routes.
+ * <p>Route access matrix:</p>
+ * <ul>
+ *   <li><b>Public</b> (no JWT required, configured via {@code jwt.public-paths}):
+ *     <ul>
+ *       <li>{@code /actuator/health} — liveness / readiness probes for Kubernetes</li>
+ *       <li>{@code /users/auth/login}, {@code /users/auth/register}, {@code /users/auth/refresh}
+ *           — authentication flows that issue tokens</li>
+ *     </ul>
+ *   </li>
+ *   <li><b>Protected</b> (JWT required, enforced by {@code JwtAuthenticationFilter}):
+ *     <ul>
+ *       <li>{@code /users/**} — user profile and account management</li>
+ *       <li>{@code /matches/**}, {@code /predictions/**}, {@code /scoring/**} — business APIs</li>
+ *     </ul>
+ *   </li>
+ *   <li><b>Protected actuator</b> (JWT required; Spring Security defers to the filter):
+ *     <ul>
+ *       <li>{@code /actuator/prometheus}, {@code /actuator/metrics}, {@code /actuator/env},
+ *           {@code /actuator/loggers} — sensitive operational endpoints</li>
+ *     </ul>
+ *   </li>
+ * </ul>
  *
- * Item 2.5: public vs protected paths. Item 2.8: actuator protection.
+ * @see com.ProdeMaster.ApiGateWay.filters.JwtAuthenticationFilter
+ * @see com.ProdeMaster.ApiGateWay.Config.JwtProperties#getPublicPaths()
+ * @see org.springframework.security.config.web.server.ServerHttpSecurity
  */
 @Configuration
 @EnableWebFluxSecurity
 public class SecurityConfig {
 
+    /**
+     * Builds the reactive security filter chain.
+     *
+     * <p>All unnecessary mechanisms are disabled so the gateway remains fully stateless:</p>
+     * <ul>
+     *   <li>CSRF — not applicable for a machine-to-machine API gateway.</li>
+     *   <li>HTTP Basic / form login / logout — superseded by JWT.</li>
+     *   <li>Security context repository — {@link org.springframework.security.web.server.context.NoOpServerSecurityContextRepository}
+     *       prevents any server-side session creation.</li>
+     * </ul>
+     *
+     * <p>The {@code authorizeExchange} rules grant {@code permitAll()} to every path.
+     * Real enforcement happens in {@link com.ProdeMaster.ApiGateWay.filters.JwtAuthenticationFilter}.</p>
+     *
+     * @param http the {@link ServerHttpSecurity} builder provided by Spring
+     * @return the configured {@link SecurityWebFilterChain}
+     */
     @Bean
     public SecurityWebFilterChain springSecurityFilterChain(ServerHttpSecurity http) {
         return http

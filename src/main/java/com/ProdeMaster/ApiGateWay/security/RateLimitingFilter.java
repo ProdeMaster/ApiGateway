@@ -31,19 +31,22 @@ import java.util.concurrent.TimeUnit;
 /**
  * Per-client rate limiting using Bucket4j (token-bucket algorithm).
  *
- * Order -90 (after JwtAuthenticationFilter at -100) so that the userId
- * attribute
- * set by the auth filter is available for per-user bucket keying.
- * Anonymous / public requests fall back to IP-based keying.
+ * <p>Order {@code -90} (after {@code JwtAuthenticationFilter} at {@code -100}) so that the
+ * {@code userId} attribute set by the auth filter is available for per-user bucket keying.
+ * Anonymous / public requests fall back to IP-based keying.</p>
  *
- * Limits are configurable via:
- * security.rate-limit.requests-per-minute (default 100)
- * security.rate-limit.burst (default 150)
+ * <p>Limits are configurable via:</p>
+ * <ul>
+ *   <li>{@code security.rate-limit.requests-per-minute} (default 100)</li>
+ *   <li>{@code security.rate-limit.burst} (default 150)</li>
+ * </ul>
  *
- * Response headers:
- * X-RateLimit-Limit — configured maximum
- * X-RateLimit-Remaining — tokens left after this request
- * X-RateLimit-Reset — epoch second when the window resets (~60s from now)
+ * <p>Response headers:</p>
+ * <ul>
+ *   <li>{@code X-RateLimit-Limit} — configured maximum</li>
+ *   <li>{@code X-RateLimit-Remaining} — tokens left after this request</li>
+ *   <li>{@code X-RateLimit-Reset} — epoch second when the window resets (~60s from now)</li>
+ * </ul>
  */
 @Component
 public class RateLimitingFilter implements GlobalFilter, Ordered {

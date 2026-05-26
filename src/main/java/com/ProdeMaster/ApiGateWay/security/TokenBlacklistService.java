@@ -15,9 +15,8 @@ import java.util.Base64;
 
 /**
  * Maintains a blacklist of revoked JWT tokens in Redis.
- * Tokens are stored by jti (or SHA-256 hash) with TTL = remaining token
- * lifetime,
- * so Redis never holds stale data after the token would have expired anyway.
+ * Tokens are stored by jti (or SHA-256 hash) with TTL equal to the remaining token
+ * lifetime, so Redis never holds stale data after the token would have expired anyway.
  */
 @Service
 public class TokenBlacklistService {

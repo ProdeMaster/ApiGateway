@@ -11,27 +11,54 @@ import reactor.util.context.ContextView;
 import jakarta.annotation.PostConstruct;
 
 /**
- * Tracing configuration.
+ * Minimal distributed-tracing configuration for Spring Boot 3.x + Micrometer Tracing.
  *
- * Item 3.7: Zipkin reporter and span handler are now auto-configured by Spring Boot from
- *   management.zipkin.tracing.endpoint (see application.properties / application-prod.properties).
- *   The hardcoded URLConnectionSender bean has been removed.
+ * <p>What Spring Boot provides automatically (no beans needed here):</p>
+ * <ul>
+ *   <li>Zipkin {@code Reporter} and span exporter — configured from
+ *       {@code management.zipkin.tracing.endpoint} in {@code application.properties}.</li>
+ *   <li>Default {@code Sampler} with probability from
+ *       {@code management.tracing.sampling.probability}.</li>
+ *   <li>{@code Tracer} bean wired to the Brave bridge.</li>
+ * </ul>
  *
- * Item 3.2: Sampling is handled by DynamicTracingSampler (@Component), which overrides the
- *   default auto-configured sampler and adjusts rates based on the authenticated role in MDC.
+ * <p>What this class adds:</p>
+ * <ul>
+ *   <li>Reactor automatic context propagation ({@link Hooks#enableAutomaticContextPropagation()})
+ *       so trace/span IDs survive thread-pool hops in the reactive pipeline.</li>
+ *   <li>An MDC {@link WebFilter} that copies trace and span IDs into SLF4J's MDC on every
+ *       request, making them available in log patterns and to
+ *       {@link DynamicTracingSampler}.</li>
+ * </ul>
+ *
+ * @see DynamicTracingSampler
  */
 @Configuration
 public class TracingConfig {
 
+    /**
+     * Enables Reactor's automatic context propagation so that Micrometer trace and span IDs
+     * are carried across reactive operator boundaries (e.g. {@code subscribeOn},
+     * {@code publishOn}, {@code flatMap} with a scheduler).
+     *
+     * <p>Without this hook, MDC entries written before a thread-pool hop would be lost,
+     * causing incomplete trace IDs in log lines.</p>
+     */
     @PostConstruct
     public void init() {
-        // Enables automatic MDC ↔ Reactor context propagation across thread hops.
         Hooks.enableAutomaticContextPropagation();
     }
 
     /**
-     * Propagates Micrometer trace/span IDs into MDC so they appear in structured log output
-     * and are accessible to DynamicTracingSampler.
+     * WebFilter that copies the current Micrometer trace and span IDs into SLF4J MDC
+     * ({@code traceId}, {@code spanId}) so they appear in structured log output.
+     *
+     * <p>The filter runs on every request and uses {@code contextWrite} to interact with
+     * the Reactor context.  Errors during MDC population are silently swallowed to avoid
+     * disrupting the request pipeline.</p>
+     *
+     * @param tracer the Micrometer {@link Tracer} auto-configured by Spring Boot
+     * @return a {@link WebFilter} bean registered for every incoming request
      */
     @Bean
     public WebFilter mdcWebFilter(Tracer tracer) {

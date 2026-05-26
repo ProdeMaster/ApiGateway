@@ -38,11 +38,52 @@ import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
 /**
- * GlobalFilter (order -100) that enforces JWT authentication on all non-public routes.
- * Validates tokens via JwtTokenProvider and injects user context headers for downstream services.
+ * Gateway-level {@link GlobalFilter} (order {@code -100}) that enforces JWT authentication
+ * on all non-public routes before any downstream routing occurs.
  *
- * Items 2.4 (headers), 2.7 (logging), 2.9 (error responses) from Phase 2.
- * Items 3.1 (blacklist check), 3.2 (MDC role for sampler), 3.3 (Prometheus metrics) from Phase 3.
+ * <p>Processing workflow per request:</p>
+ * <ol>
+ *   <li>If the request path matches a public pattern from {@code jwt.public-paths}, the filter
+ *       is bypassed entirely.</li>
+ *   <li>The {@code Authorization: Bearer &lt;token&gt;} header is extracted.  A missing or
+ *       malformed header results in an immediate {@code 401} with
+ *       {@link com.ProdeMaster.ApiGateWay.dto.ErrorCode#MISSING_TOKEN}.</li>
+ *   <li>The token is validated by {@link JwtTokenProvider#validateAndExtract(String)}.
+ *       Typed failures are mapped to structured {@code 401} error responses.</li>
+ *   <li>The token identifier ({@code jti} or SHA-256 fingerprint) is checked against the
+ *       Redis blacklist via {@link TokenBlacklistService}.</li>
+ *   <li>On success, user-context headers are injected into the mutated downstream request
+ *       and the raw {@code Authorization} header is removed.</li>
+ * </ol>
+ *
+ * <p>Headers added to the downstream request:</p>
+ * <ul>
+ *   <li>{@code X-User-Id} — value of the {@code sub} claim (user identifier)</li>
+ *   <li>{@code X-Roles} — comma-separated list from the {@code roles} claim</li>
+ *   <li>{@code X-Token-Issued-At} — {@code iat} claim value in epoch milliseconds</li>
+ *   <li>{@code X-Auth-Source} — always {@code "jwt"} for audit purposes</li>
+ * </ul>
+ *
+ * <p>Error response format (all {@code 401} rejections):</p>
+ * <pre>{@code
+ * {
+ *   "error":     "EXPIRED_TOKEN",
+ *   "message":   "Token expired",
+ *   "traceId":   "3fa2c1d0-...",
+ *   "timestamp": "2026-05-22T14:00:00Z",
+ *   "path":      "/users/profile"
+ * }
+ * }</pre>
+ *
+ * <p>Metrics (Micrometer counters, visible at {@code /actuator/prometheus}):</p>
+ * <ul>
+ *   <li>{@code jwt.validations.total[result="success|expired|invalid|missing|blacklisted"]}</li>
+ *   <li>{@code jwt.validations.duration_seconds} — histogram with p95/p99 percentiles</li>
+ * </ul>
+ *
+ * @see JwtTokenProvider
+ * @see TokenBlacklistService
+ * @see com.ProdeMaster.ApiGateWay.dto.ErrorCode
  */
 @Component
 public class JwtAuthenticationFilter implements GlobalFilter, Ordered {
@@ -56,6 +97,15 @@ public class JwtAuthenticationFilter implements GlobalFilter, Ordered {
     private final JwtProperties jwtProperties;
     private final MeterRegistry meterRegistry;
 
+    /**
+     * Constructs the filter with all required collaborators.
+     *
+     * @param jwtTokenProvider  validates JWT tokens and extracts claims
+     * @param tokenBlacklistService checks whether a token has been explicitly revoked
+     * @param objectMapper      serialises {@link com.ProdeMaster.ApiGateWay.dto.ErrorResponse} to JSON
+     * @param jwtProperties     runtime configuration (public-paths, verbose logging, etc.)
+     * @param meterRegistry     Micrometer registry for counter and timer registration
+     */
     public JwtAuthenticationFilter(JwtTokenProvider jwtTokenProvider,
                                     TokenBlacklistService tokenBlacklistService,
                                     ObjectMapper objectMapper,
@@ -68,11 +118,34 @@ public class JwtAuthenticationFilter implements GlobalFilter, Ordered {
         this.meterRegistry = meterRegistry;
     }
 
+    /**
+     * Returns {@code -100} so this filter runs first in the gateway chain, before
+     * {@code RateLimitingFilter} ({@code -90}) and {@code SecurityHeadersFilter} ({@code -50}).
+     *
+     * @return filter order value
+     */
     @Override
     public int getOrder() {
         return -100;
     }
 
+    /**
+     * Authenticates the incoming request and, on success, enriches it with user-context
+     * headers before passing it to the next filter in the chain.
+     *
+     * <p>The method is fully non-blocking: all I/O (token validation on a bounded-elastic
+     * scheduler, Redis blacklist check) is performed reactively.  MDC entries
+     * ({@code user_role}) are written after successful authentication and cleared via
+     * {@code doFinally} to prevent context leaks across reactive operator boundaries.</p>
+     *
+     * @param exchange the current server exchange, providing access to request and response
+     * @param chain    the remaining filter chain to invoke if authentication succeeds
+     * @return a {@link Mono Mono&lt;Void&gt;} that:
+     *         <ul>
+     *           <li>completes normally after the downstream chain finishes, or</li>
+     *           <li>completes after writing a {@code 401} error response if authentication fails</li>
+     *         </ul>
+     */
     @Override
     public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
         ServerHttpRequest request = exchange.getRequest();

@@ -14,7 +14,7 @@ import reactor.core.publisher.Mono;
 
 /**
  * Injects OWASP-recommended security headers on all HTTP responses.
- * Uses beforeCommit to guarantee headers are set right before the response is written.
+ * Uses {@code beforeCommit} to guarantee headers are set right before the response is written.
  * Runs at order -50: after JwtAuthenticationFilter (-100) but before routing.
  */
 @Component
